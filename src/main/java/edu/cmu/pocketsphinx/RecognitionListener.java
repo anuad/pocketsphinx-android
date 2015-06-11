@@ -1,6 +1,7 @@
 package edu.cmu.pocketsphinx;
 
 import edu.cmu.pocketsphinx.Hypothesis;
+import edu.cmu.pocketsphinx.NBestList;
 
 public interface RecognitionListener {
 
@@ -17,12 +18,12 @@ public interface RecognitionListener {
     /**
      * Called when partial recognition result is available.
      */
-    public void onPartialResult(Hypothesis hypothesis);
+    public void onPartialResult(Hypothesis hypothesis, NBestList nbest);
 
     /**
      * Called after the recognition is ended.
      */
-    public void onResult(Hypothesis hypothesis);
+    public void onResult(Hypothesis hypothesis, NBestList nbest);
 
     /**
      * Gives the read data. This must not block. Client must copy the data immediately if needed.
@@ -32,7 +33,7 @@ public interface RecognitionListener {
     public void onRead(short[] buffer, int offset, int nread);
 
     public void onReady();
-    public void onError();
+    public void onError(Exception e);
 }
 
 /* vim: set ts=4 sw=4: */
