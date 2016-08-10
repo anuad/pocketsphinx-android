@@ -34,16 +34,28 @@ import static java.lang.String.format;
 
 import java.io.File;
 import java.io.IOException;
+import java.io.InputStream;
+import java.io.PipedOutputStream;
+import java.nio.ByteBuffer;
+import java.nio.ByteOrder;
+
 import java.util.Collection;
 import java.util.HashSet;
 
 import android.media.AudioFormat;
 import android.media.AudioRecord;
 import android.media.MediaRecorder.AudioSource;
-import android.os.Handler;
-import android.os.Looper;
+import android.media.audiofx.AudioEffect;
+import android.media.audiofx.NoiseSuppressor;
+
+import android.os.*;
+
 import android.util.Log;
 
+import edu.cmu.pocketsphinx.Config;
+import edu.cmu.pocketsphinx.Decoder;
+import edu.cmu.pocketsphinx.Hypothesis;
+import edu.cmu.pocketsphinx.NBestList;
 /**
  * Main class to access recognizer functions. After configuration this class
  * starts a listener thread which records the data and recognizes it using
@@ -53,160 +65,140 @@ import android.util.Log;
  */
 public class SpeechRecognizer {
 
-    protected static final String TAG = SpeechRecognizer.class.getSimpleName();
+  protected static final String TAG = SpeechRecognizer.class.getSimpleName();
 
-    private final Decoder decoder;
+  public static int BUFFER_SIZE = 2 * 1024;
+  public static int INPUT_SIZE = 16 * 1024;
 
-    private final int sampleRate;        
-    private final static float BUFFER_SIZE_SECONDS = 0.4f;
-    private int bufferSize;
-    private final AudioRecord recorder;
-    
-    private Thread recognizerThread;
+  public static boolean DEBUG_MSGS_ALLOWED = true;
 
-    private final Handler mainHandler = new Handler(Looper.getMainLooper());
-    
-    private final Collection<RecognitionListener> listeners = new HashSet<RecognitionListener>();
-    
-    /**
-     * Creates speech recognizer. Recognizer holds the AudioRecord object, so you 
-     * need to call {@link release} in order to properly finalize it.
-     * 
-     * @param config The configuration object
-     * @throws IOException thrown if audio recorder can not be created for some reason.
-     */
-    protected SpeechRecognizer(Config config) throws IOException {
-        decoder = new Decoder(config);
-        sampleRate = (int)decoder.getConfig().getFloat("-samprate");
-        bufferSize = Math.round(sampleRate * BUFFER_SIZE_SECONDS);
-        recorder = new AudioRecord(
-                AudioSource.VOICE_RECOGNITION, sampleRate,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT, bufferSize * 2);
+  private final Decoder decoder;
 
-        if (recorder.getState() == AudioRecord.STATE_UNINITIALIZED) {
-            recorder.release();
-            throw new IOException(
-                    "Failed to initialize recorder. Microphone might be already in use.");
-        }
+  private RecognizerThread recognizerThread;
+  private final Handler mainHandler;
+  protected final Collection<RecognitionListener> listeners = new HashSet<RecognitionListener>();
+
+  private final int sampleRate;
+  private long minSpeechTimeMilis = 2000;
+  private long maxSpeechTimeMilis = 5000;
+
+  protected SpeechRecognizer(Config config) {
+    sampleRate = (int) config.getFloat("-samprate");
+    if (config.getFloat("-samprate") != sampleRate)
+      throw new IllegalArgumentException("sampling rate must be integer");
+
+    decoder = new Decoder(config);
+    mainHandler = new Handler(Looper.getMainLooper());
+  }
+
+  /**
+   * Meant only for testing.
+   * @param forTesting
+   */
+  protected SpeechRecognizer(boolean forTesting) {
+    if (!forTesting) {
+      throw new IllegalArgumentException("This constructor is meant for testing only");
+    }
+    sampleRate = -1;
+    decoder = null;
+    mainHandler = null;
+  }
+
+  public void setMinSpeechTime(long timeMilis) {
+    this.minSpeechTimeMilis = timeMilis;
+  }
+  public void setMaxSpeechTime(long timeMilis) {
+    this.maxSpeechTimeMilis = timeMilis;
+  }
+
+  /**
+   * Adds listener.
+   */
+  public void addListener(RecognitionListener listener) {
+    synchronized (listeners) {
+      listeners.add(listener);
+    }
+  }
+
+  /**
+   * Removes listener.
+   */
+  public void removeListener(RecognitionListener listener) {
+    synchronized (listeners) {
+      listeners.remove(listener);
+    }
+  }
+
+  /**
+   * Starts recognition. Does nothing if recognition is active.
+   * 
+   * @return true if recognition was actually started
+   */
+  public boolean startListening(String searchName) {
+    if (null != recognizerThread && recognizerThread.isAlive())
+      return false;
+
+    if (DEBUG_MSGS_ALLOWED) Log.i(TAG, format("Start recognition \"%s\"", searchName));
+    decoder.setSearch(searchName);
+    recognizerThread = new RecognizerThread(new AudioRecordSource());
+    recognizerThread.start();
+    return true;
+  }
+
+  /**
+   * Starts recognition. After specified timeout listening stops and the
+   * endOfSpeech signals about that. Does nothing if recognition is active.
+   * 
+   * @timeout - timeout in milliseconds to listen.
+   * 
+   * @return true if recognition was actually started
+   */
+  public boolean startListening(String searchName, int timeout) {
+          return false;
+  }
+
+  /**
+   * Stops recognition. All listeners should receive final result if there is
+   * any. Does nothing if recognition is not active.
+   * 
+   * @return true if recognition was actually stopped
+   */
+  public boolean stop() {
+    if (null == recognizerThread)
+      return false;
+
+    try {
+      recognizerThread.interrupt();
+      recognizerThread.join();
+    } catch (InterruptedException e) {
+      // Restore the interrupted status.
+      Thread.currentThread().interrupt();
     }
 
-    /**
-     * Adds listener.
-     */
-    public void addListener(RecognitionListener listener) {
-        synchronized (listeners) {
-            listeners.add(listener);
-        }
+    recognizerThread = null;
+
+    if (DEBUG_MSGS_ALLOWED) {
+      Log.i(TAG, "Stop recognition");
     }
 
-    /**
-     * Removes listener.
-     */
-    public void removeListener(RecognitionListener listener) {
-        synchronized (listeners) {
-            listeners.remove(listener);
-        }
+    return true;
+  }
+
+  /**
+   * Cancels recogition. Listeners do not recevie final result. Does nothing if
+   * recognition is not active.
+   * 
+   * @return true if recognition was actually canceled
+   */
+  public boolean cancel() {
+    if (recognizerThread != null) {
+      recognizerThread.cancelled = true;
     }
-
-    /**
-     * Starts recognition. Does nothing if recognition is active.
-     * 
-     * @return true if recognition was actually started
-     */
-    public boolean startListening(String searchName) {
-        if (null != recognizerThread)
-            return false;
-
-        Log.i(TAG, format("Start recognition \"%s\"", searchName));
-        decoder.setSearch(searchName);
-        recognizerThread = new RecognizerThread();
-        recognizerThread.start();
-        return true;
-    }
-
-    /**
-     * Starts recognition. After specified timeout listening stops and the
-     * endOfSpeech signals about that. Does nothing if recognition is active.
-     * 
-     * @timeout - timeout in milliseconds to listen.
-     * 
-     * @return true if recognition was actually started
-     */
-    public boolean startListening(String searchName, int timeout) {
-        if (null != recognizerThread)
-            return false;
-
-        Log.i(TAG, format("Start recognition \"%s\"", searchName));
-        decoder.setSearch(searchName);
-        recognizerThread = new RecognizerThread(timeout);
-        recognizerThread.start();
-        return true;
-    }
-
-    private boolean stopRecognizerThread() {
-        if (null == recognizerThread)
-            return false;
-
-        try {
-            recognizerThread.interrupt();
-            recognizerThread.join();
-        } catch (InterruptedException e) {
-            // Restore the interrupted status.
-            Thread.currentThread().interrupt();
-        }
-
-        recognizerThread = null;
-        return true;
-    }
-
-    /**
-     * Stops recognition. All listeners should receive final result if there is
-     * any. Does nothing if recognition is not active.
-     * 
-     * @return true if recognition was actually stopped
-     */
-    public boolean stop() {
-        boolean result = stopRecognizerThread();
-        if (result) {
-            Log.i(TAG, "Stop recognition");
-            final Hypothesis hypothesis = decoder.hyp();
-            mainHandler.post(new ResultEvent(hypothesis, true));
-        }
-        return result;
-    }
-
-    /**
-     * Cancels recognition. Listeners do not receive final result. Does nothing
-     * if recognition is not active.
-     * 
-     * @return true if recognition was actually canceled
-     */
-    public boolean cancel() {
-        boolean result = stopRecognizerThread();
-        if (result) {
-            Log.i(TAG, "Cancel recognition");
-        }
-
-        return result;
-    }
-    
-    /**
-     * Returns the decoder object for advanced operation (dictionary extension, utterance
-     * data collection, adaptation and so on).
-     * 
-     * @return Decoder
-     */
-    public Decoder getDecoder() {
-        return decoder;
-    }
-    
-    /**
-     * Shutdown the recognizer and release the recorder
-     */
-    public void shutdown() {
-        recorder.release();
-    }
+    if (DEBUG_MSGS_ALLOWED) Log.i(TAG, "Cancel recognition");
+    mainHandler.removeCallbacksAndMessages(null);
+    recognizerThread = null;
+    return true;
+  }
     
     /**
      * Gets name of the currently active search.
@@ -259,6 +251,30 @@ public class SpeechRecognizer {
         decoder.setKeyphrase(name, phrase);
     }
 
+
+	/**
+	 * Adds search based on a single phrase.
+	 * 
+	 * @param name
+	 *            search name
+	 * @param phrase
+	 *            search phrase
+	 */
+	public void addKeywordSearch(String name, String phrase) {
+		decoder.setKws(name, phrase);
+	}
+
+    /**
+     * Returns the decoder object for advanced operation (dictionary extension, utterance
+     * data collection, adaptation and so on).
+     * 
+     * @return Decoder
+     */
+    public Decoder getDecoder() {
+        return decoder;
+    }
+    
+
     /**
      * Adds search based on a keyphrase file.
      * 
@@ -287,152 +303,285 @@ public class SpeechRecognizer {
     public void addAllphoneSearch(String name, File file) {
         decoder.setAllphoneFile(name, file.getPath());
     }
+  public interface SoundSource {
+	    int read(short[] buffer, int offset, int length);
+	    boolean start();
+	    void stop();
+	    void release();
+	  }
 
-    private final class RecognizerThread extends Thread {
-        
-        private int remainingSamples;
-        private int timeoutSamples;
-        private final static int NO_TIMEOUT = -1;
+	  class InputStreamSource implements SoundSource {
+	    private final InputStream stream;
+	    private boolean finished;
+	    InputStreamSource(InputStream stream) {
+	      this.stream = stream;
+	    }
 
-        public RecognizerThread(int timeout) {
-            if (timeout != NO_TIMEOUT)
-                this.timeoutSamples = timeout * sampleRate / 1000;
-            else
-                this.timeoutSamples = NO_TIMEOUT;
-            this.remainingSamples = this.timeoutSamples;
-        }
+	    @Override
+	    public int read(short[] buffer, int offset, int length) {
+	      if (finished) {
+	        return 0;
+	      }
 
-        public RecognizerThread() {
-            this(NO_TIMEOUT);
-        }
+	      try {
+	        int bytelength = 2 * length;
+	        byte[] barr = new byte[bytelength];
+	        int nread = stream.read(barr);
+	        if (nread == -1) {
+	          finished = true;
+	          Thread.currentThread().interrupt();
+	          return 0;
+	        }
 
-        @Override
-        public void run() {
+	        ByteBuffer.wrap(barr).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(buffer, offset, nread/2);
+	        return nread/2;
+	      } catch (IOException e) {
+	        throw new IllegalStateException(e);
+	      }
+	    }
 
-            recorder.startRecording();
-            if (recorder.getRecordingState() == AudioRecord.RECORDSTATE_STOPPED) {
-                recorder.stop();
-                IOException ioe = new IOException(
-                        "Failed to start recording. Microphone might be already in use.");
-                mainHandler.post(new OnErrorEvent(ioe));
-                return;
-            }
+	    @Override
+	    public boolean start() {
+	      return true;
+	    }
 
-            Log.d(TAG, "Starting decoding");
+	    @Override
+	    public void stop() {
+	    }
 
-            decoder.startUtt();
-            short[] buffer = new short[bufferSize];
-            boolean inSpeech = decoder.getInSpeech();
+	    @Override
+	    public void release() {
+	      try {
+	        stream.close();
+	      } catch (IOException e) {
+	        throw new IllegalStateException(e);
+	      }
+	    }
+	  }
 
-            // Skip the first buffer, usually zeroes
-            recorder.read(buffer, 0, buffer.length);
+	  // This is a hack, sometimes audiorecorder.record is throwing illegalstateexception
+	  // this can happen if it is not released from an earlier use.
+	  private static AudioRecordSource audioRecordSource;
 
-            while (!interrupted()
-                    && ((timeoutSamples == NO_TIMEOUT) || (remainingSamples > 0))) {
-                int nread = recorder.read(buffer, 0, buffer.length);
+	  class AudioRecordSource implements SoundSource {
+	    AudioRecord recorder;
+	    AudioEffect suppressor;
 
-                if (-1 == nread) {
-                    throw new RuntimeException("error reading audio buffer");
-                } else if (nread > 0) {
-                    decoder.processRaw(buffer, nread, false, false);
+	    @Override
+	    public int read(short[] buffer, int offset, int length) {
+	      return recorder.read(buffer, offset, length);
+	    }
 
-                    // int max = 0;
-                    // for (int i = 0; i < nread; i++) {
-                    //     max = Math.max(max, Math.abs(buffer[i]));
-                    // }
-                    // Log.e("!!!!!!!!", "Level: " + max);
-                    
-                    if (decoder.getInSpeech() != inSpeech) {
-                        inSpeech = decoder.getInSpeech();
-                        mainHandler.post(new InSpeechChangeEvent(inSpeech));
-                    }
+	    @Override
+	    public boolean start() {
+	      synchronized (TAG) {
+	        if (audioRecordSource != null) {
+	          audioRecordSource.stop();
+	          audioRecordSource.release();
+	        }
+	        if (suppressor != null) {
+	          suppressor.release();
+	        }
+	        audioRecordSource = this;
+	      }
+	      recorder = new AudioRecord(AudioSource.VOICE_RECOGNITION,
+	          sampleRate, AudioFormat.CHANNEL_IN_MONO,
+	          AudioFormat.ENCODING_PCM_16BIT, INPUT_SIZE);
+	      if (Build.VERSION.SDK_INT >= 16) {
+	        if (NoiseSuppressor.isAvailable()) {
+	          suppressor = NoiseSuppressor.create(recorder.getAudioSessionId());
+	          if (!suppressor.getEnabled()) {
+	            suppressor.setEnabled(true);
+	          }
+	        }
+	      }
 
-                    if (inSpeech)
-                        remainingSamples = timeoutSamples;
+	      if (recorder.getState() == AudioRecord.STATE_UNINITIALIZED) {
+	        release();
+	        return false;
+	      }
 
-                    final Hypothesis hypothesis = decoder.hyp();
-                    mainHandler.post(new ResultEvent(hypothesis, false));
-                }
+	      recorder.startRecording();
+	      return true;
+	    }
 
-                if (timeoutSamples != NO_TIMEOUT) {
-                    remainingSamples = remainingSamples - nread;
-                }
-            }
+	    @Override
+	    public void stop() {
+	      if (recorder.getState() == AudioRecord.STATE_INITIALIZED &&
+	          recorder.getRecordingState() == AudioRecord.RECORDSTATE_RECORDING) {
+	        recorder.stop();
+	      }
+	    }
 
-            recorder.stop();
-            decoder.endUtt();
+	    @Override
+	    public void release() {
+	      synchronized (TAG) {
+	        if (audioRecordSource == this) {
+	          audioRecordSource = null;
+	        }
+	        if (suppressor != null) {
+	          suppressor.release();
+	        }
+	      }
+	      recorder.release();
+	    }
+	  }
 
-            // Remove all pending notifications.
-            mainHandler.removeCallbacksAndMessages(null);
+	  public void process(String searchName, InputStream stream) {
+		    decoder.setSearch(searchName);
+		    recognizerThread = new RecognizerThread(new InputStreamSource(stream));
+		    recognizerThread.start();
+		  }
 
-            // If we met timeout signal that speech ended
-            if (timeoutSamples != NO_TIMEOUT && remainingSamples <= 0) {
-                mainHandler.post(new TimeoutEvent());
-            }
-        }
-    }
-
-    private abstract class RecognitionEvent implements Runnable {
-        public void run() {
-            RecognitionListener[] emptyArray = new RecognitionListener[0];
-            for (RecognitionListener listener : listeners.toArray(emptyArray))
-                execute(listener);
-        }
-
-        protected abstract void execute(RecognitionListener listener);
-    }
-
-    private class InSpeechChangeEvent extends RecognitionEvent {
-        private final boolean state;
-
-        InSpeechChangeEvent(boolean state) {
-            this.state = state;
-        }
-
-        @Override
-        protected void execute(RecognitionListener listener) {
-            if (state)
-                listener.onBeginningOfSpeech();
-            else
-                listener.onEndOfSpeech();
-        }
-    }
-
-    private class ResultEvent extends RecognitionEvent {
-        protected final Hypothesis hypothesis;
-        private final boolean finalResult;
-
-        ResultEvent(Hypothesis hypothesis, boolean finalResult) {
-            this.hypothesis = hypothesis;
-            this.finalResult = finalResult;
-        }
-
-        @Override
-        protected void execute(RecognitionListener listener) {
-            if (finalResult)
-                listener.onResult(hypothesis);
-            else
-                listener.onPartialResult(hypothesis);
-        }
-    }
-
-    private class OnErrorEvent extends RecognitionEvent {
-        private final Exception exception;
-
-        OnErrorEvent(Exception exception) {
-            this.exception = exception;
-        }
-
-        @Override
-        protected void execute(RecognitionListener listener) {
-            listener.onError(exception);
-        }
-    }
-
-    private class TimeoutEvent extends RecognitionEvent {
-        @Override
-        protected void execute(RecognitionListener listener) {
-            listener.onTimeout();
-        }
-    }
 }
+  private final class RecognizerThread extends Thread {
+    private SoundSource source;
+    private long startTime;
+    private boolean cancelled;
+    private boolean eosSent;
+
+    public RecognizerThread(SoundSource source) {
+      this.source = source;
+    }
+
+    @Override
+    public void run() {
+      if (!source.start()) {
+        mainHandler.post(new OnErrorEvent(
+        		new IOException(
+                        "Failed to start recording. Microphone might be already in use.")));
+        return;
+      }
+
+      decoder.startUtt();
+      mainHandler.post(new StartEvent());
+      short[] buffer = new short[BUFFER_SIZE];
+      boolean startedSpeaking = false;
+
+      startTime = System.currentTimeMillis();
+      while (!interrupted() && !cancelled
+          && System.currentTimeMillis() - startTime < maxSpeechTimeMilis) {
+        int nread = source.read(buffer, 0, buffer.length);
+
+        if (-1 == nread) {
+          break;
+        } else if (nread > 0) {
+          decoder.processRaw(buffer, nread, false, false);
+
+          RecognitionListener[] emptyArray = {};
+          for (RecognitionListener listener : listeners.toArray(emptyArray)) {
+            listener.onRead(buffer, 0, nread);
+          }
+
+          if (decoder.getInSpeech() && !startedSpeaking) {
+            startedSpeaking = true;
+            System.out.println("Started speaking");
+            mainHandler.post(new InSpeechChangeEvent(true));
+          }
+          if (!decoder.getInSpeech() && startedSpeaking) {
+            // Speaker is silent now.
+            if (System.currentTimeMillis() - startTime > minSpeechTimeMilis) {
+              if (!eosSent) {
+                eosSent = true;
+                System.out.println("Stopped speaking");
+                mainHandler.post(new InSpeechChangeEvent(false));
+              }
+            }
+          }
+          
+          final Hypothesis hypothesis = decoder.hyp();
+          final NBestList nbestList = decoder.nbest();
+          if (null != hypothesis)
+            mainHandler.post(new ResultEvent(hypothesis, false,nbestList));
+        }
+      }
+
+      source.stop();
+      int nread = source.read(buffer, 0, buffer.length);
+      source.release();
+      if (nread > 0) {
+        decoder.processRaw(buffer, nread, false, false);
+      }
+      decoder.endUtt();
+      
+
+      // Remove all pending notifications.
+      mainHandler.removeCallbacksAndMessages(null);
+      if (!cancelled) {
+        final Hypothesis hypothesis = decoder.hyp();
+        final NBestList nbestList = decoder.nbest();
+        if (null != hypothesis) {
+          mainHandler.post(new ResultEvent(hypothesis, true,nbestList));
+        } else {
+          mainHandler.post(new ResultEvent(null, true,nbestList));
+        }
+      }
+    }
+  }
+
+  private class StartEvent extends RecognitionEvent {
+    @Override
+    protected void execute(RecognitionListener listener) {
+      listener.onReady();
+    }
+  }
+
+  private abstract class RecognitionEvent implements Runnable {
+      public void run() {
+          RecognitionListener[] emptyArray = new RecognitionListener[0];
+          for (RecognitionListener listener : listeners.toArray(emptyArray))
+              execute(listener);
+      }
+
+      protected abstract void execute(RecognitionListener listener);
+  }
+
+  private class InSpeechChangeEvent extends RecognitionEvent {
+      private final boolean state;
+
+      InSpeechChangeEvent(boolean state) {
+          this.state = state;
+      }
+
+      @Override
+      protected void execute(RecognitionListener listener) {
+          if (state)
+              listener.onBeginningOfSpeech();
+          else
+              listener.onEndOfSpeech();
+      }
+  }
+
+  private class ResultEvent extends RecognitionEvent {
+      protected final Hypothesis hypothesis;
+      private final boolean finalResult;
+      protected final NBestList nbestList;
+
+      ResultEvent(Hypothesis hypothesis, boolean finalResult, NBestList nbestList) {
+          this.hypothesis = hypothesis;
+          this.finalResult = finalResult;
+          this.nbestList = nbestList;
+      }
+
+      @Override
+      protected void execute(RecognitionListener listener) {
+          if (finalResult)
+              listener.onResult(hypothesis,nbestList);
+          else
+              listener.onPartialResult(hypothesis,nbestList);
+      }
+  }
+
+  private class OnErrorEvent extends RecognitionEvent {
+      private final Exception exception;
+
+      OnErrorEvent(Exception exception) {
+          this.exception = exception;
+      }
+
+      @Override
+      protected void execute(RecognitionListener listener) {
+          listener.onError(exception);
+      }
+  }
+
